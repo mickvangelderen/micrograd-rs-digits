@@ -2,7 +2,7 @@ mod dataset;
 
 use dataset::load_digits;
 use micrograd_rs::{
-    engine::{Gradients, NodeId, Operations, Values},
+    engine::{Expr, Gradients, NodeId, Operations, Values},
     nn::FullyConnectedLayer,
 };
 
@@ -55,9 +55,9 @@ fn main() -> anyhow::Result<()> {
     // Construct computation graph.
     let mut ops = Operations::default();
     let l0 = ops.vars::<64>();
-    let l1 = FullyConnectedLayer::new(&l0, 64, &mut ops);
-    let l2 = FullyConnectedLayer::new(l1.outputs(), 64, &mut ops);
-    let l3 = FullyConnectedLayer::new(l2.outputs(), 10, &mut ops);
+    let l1 = FullyConnectedLayer::new(&l0, 64, &mut ops, Expr::relu);
+    let l2 = FullyConnectedLayer::new(l1.outputs(), 64, &mut ops, Expr::relu);
+    let l3 = FullyConnectedLayer::new(l2.outputs(), 10, &mut ops, Expr::relu);
     let y_true = ops.vars::<10>(); // One-hot encoded target
     let loss = one_hot_mse_loss(l3.outputs(), &y_true, &mut ops).unwrap();
     let ops = ops;
@@ -75,8 +75,8 @@ fn main() -> anyhow::Result<()> {
     init_weights_uniform(l3.weights(), &mut values);
     init_weights_uniform(l3.biases(), &mut values);
 
-    const LR: f64 = 0.001;
-    const BATCH_SIZE: usize = 64;
+    const LR: f64 = 0.005;
+    const BATCH_SIZE: usize = 16;
 
     let mut indices: Vec<usize> = (0..train_data.len()).collect();
     for epoch in 0..10 {
@@ -118,6 +118,8 @@ fn main() -> anyhow::Result<()> {
             update_weights(l3.biases(), &mut values, &batch_gradients);
         }
     }
+
+    
 
     Ok(())
 }
