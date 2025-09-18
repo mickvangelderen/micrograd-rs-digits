@@ -25,4 +25,8 @@ Test accuracy: 88.89% (320/360 correct)
 Saved 360 digit images to test_predictions/
 ```
 
-Code quality is not great, had claude generate the less exciting parts, but the point was to build something that does a thing, and this does a thing!
+We're getting about a 90% accuracy. This digit was predicted to be a `9` but is actually labelled as a `4`:
+
+![failure](./digit_0174_wrong_pred9_actual4_upscaled.png)
+
+I used claude code to generate the less exciting parts of the code here, it can be improved. The micrograd-rs library is hand-written and of higher quality. 
