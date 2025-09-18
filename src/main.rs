@@ -1,10 +1,15 @@
 mod dataset;
 
 use dataset::load_digits;
+use image::{ImageBuffer, Luma};
 use micrograd_rs::{
     engine::{Expr, Gradients, NodeId, Operations, Values},
     nn::FullyConnectedLayer,
 };
+use std::fs;
+
+const PIXEL_MAX: u8 = 16;
+const LABEL_MAX: u8 = 9;
 
 fn init_weights_uniform(weights: &[NodeId], values: &mut Values) {
     for &weight in weights {
@@ -34,9 +39,6 @@ fn main() -> anyhow::Result<()> {
     println!("Loading digits dataset...");
     let dataset = load_digits()?;
     println!("Loaded {} samples", dataset.len());
-
-    const PIXEL_MAX: u8 = 16;
-    const LABEL_MAX: u8 = 9;
 
     for &(ref pixels, label) in &dataset {
         assert!(pixels.iter().copied().all(|v| v <= PIXEL_MAX));
@@ -119,7 +121,52 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    
+    // Compute predictions on test set
+    println!("\nComputing predictions on test set...");
+    let mut predictions = Vec::new();
+
+    for (pixels, _) in test_data {
+        // Set input pixels
+        for (i, &pixel) in pixels.iter().enumerate() {
+            values[l0[i]] = pixel as f64 / (PIXEL_MAX as f64);
+        }
+
+        ops.forward(&mut values);
+
+        // Find the class with highest output
+        let predicted_label = l3
+            .outputs()
+            .iter()
+            .enumerate()
+            .max_by_key(|&(_, &node_id)| (values[node_id] * 1000000.0) as i64)
+            .map(|(i, _)| i as u8)
+            .unwrap();
+
+        predictions.push(predicted_label);
+    }
+
+    // Calculate accuracy
+    let correct = predictions
+        .iter()
+        .copied()
+        .zip(test_data.iter())
+        .filter(|&(pred, &(_, actual))| pred == actual)
+        .count();
+    let accuracy = correct as f64 / test_data.len() as f64;
+    println!(
+        "Test accuracy: {:.2}% ({}/{} correct)",
+        accuracy * 100.0,
+        correct,
+        test_data.len()
+    );
+
+    // Save test images with predictions
+    save_digit_images(
+        test_data,
+        Some(&predictions),
+        "test_predictions",
+        test_data.len(),
+    )?;
 
     Ok(())
 }
@@ -150,4 +197,46 @@ fn print_histogram<const N: usize>(histogram: &[u32; N], name: &str) {
             println!("  {}: {}", value, count);
         }
     }
+}
+
+fn save_digit_images(
+    dataset: &[([u8; 64], u8)],
+    predictions: Option<&[u8]>,
+    output_dir: &str,
+    max_images: usize,
+) -> anyhow::Result<()> {
+    fs::create_dir_all(output_dir)?;
+
+    for (i, (pixels, actual_label)) in dataset.iter().enumerate().take(max_images) {
+        // Create 8x8 grayscale image from 64 pixels
+        let img = ImageBuffer::from_fn(8, 8, |x, y| {
+            let pixel_index = (y * 8 + x) as usize;
+            let pixel_value = (pixels[pixel_index] as f32 / PIXEL_MAX as f32 * 255.0) as u8;
+            Luma([pixel_value])
+        });
+
+        let filename = if let Some(preds) = predictions {
+            let predicted_label = preds[i];
+            let status = if predicted_label == *actual_label {
+                "correct"
+            } else {
+                "wrong"
+            };
+            format!(
+                "{}/digit_{:04}_{}_pred{}_actual{}.png",
+                output_dir, i, status, predicted_label, actual_label
+            )
+        } else {
+            format!("{}/digit_{:04}_actual{}.png", output_dir, i, actual_label)
+        };
+
+        img.save(&filename)?;
+    }
+
+    println!(
+        "Saved {} digit images to {}/",
+        dataset.len().min(max_images),
+        output_dir
+    );
+    Ok(())
 }
