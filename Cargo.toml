@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-micrograd-rs = { git = "https://github.com/mickvangelderen/micrograd-rs.git", rev = "72cae0cb790dad51340e6a9e6cc1ec272c107813" }
+micrograd-rs = { git = "https://github.com/mickvangelderen/micrograd-rs.git", rev = "5419bdc4f6a9207fbeba6d11b604d481addf78ecd10c11ad51e76c2f6482748d" }
 ureq = "2.10"
 anyhow = "1.0"
 csv = "1.3"

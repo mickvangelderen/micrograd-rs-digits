@@ -4,35 +4,40 @@ use dataset::load_digits;
 use image::{ImageBuffer, Luma};
 use micrograd_rs::{
     engine::{Expr, Gradients, NodeId, Operations, Values},
-    nn::FullyConnectedLayer,
+    iter_ext::IteratorExt as _,
+    nn::{self, FullyConnectedLayer},
+    view::{IndexTuple, View},
 };
 use std::fs;
 
 const PIXEL_MAX: u8 = 16;
 const LABEL_MAX: u8 = 9;
 
-fn init_weights_uniform(weights: &[NodeId], values: &mut Values) {
-    for &weight in weights {
+fn init_layer_parameters(layer: &FullyConnectedLayer, values: &mut Values) {
+    for &weight in layer.weights().iter() {
         values[weight] = (rand::random::<f64>() - 0.5) * 0.1;
     }
-}
-
-fn update_weights(weights: &[NodeId], values: &mut Values, gradients: &Gradients) {
-    for &weight in weights {
-        values[weight] -= gradients[weight];
+    for &bias in layer.biases().iter() {
+        values[bias] = 0.0;
     }
 }
 
-fn one_hot_mse_loss(y_pred: &[NodeId], y: &[NodeId], ops: &mut Operations) -> Option<NodeId> {
+fn update_weights(layer: &FullyConnectedLayer, values: &mut Values, gradients: &Gradients) {
+    for &node in layer.weights().iter().chain(layer.biases().iter()) {
+        values[node] -= gradients[node];
+    }
+}
+
+fn loss_mse(
+    y_pred: View<&[NodeId], (nn::B, nn::I)>,
+    y: View<&[NodeId], (nn::B, nn::I)>,
+    ops: &mut Operations,
+) -> Option<NodeId> {
     assert_eq!(y_pred.len(), y.len());
-    let mut pairs = y_pred.iter().zip(y.iter());
-
-    let (&first_y_pred, &first_y) = pairs.next()?;
-
-    Some(pairs.fold(
-        ops.insert((first_y_pred - first_y).pow_2()),
-        |sum, (&y_pred, &y)| ops.insert(sum + (y_pred - y).pow_2()),
-    ))
+    // We can sum over the batch and over the output dimensions.
+    let mut terms = y_pred.len().indices().map(|i| (y_pred[i] - y[i]).pow_2());
+    let first = terms.next().map(|term| ops.insert(term))?;
+    Some(terms.fold(first, |sum, term| ops.insert(sum + term)))
 }
 
 fn main() -> anyhow::Result<()> {
@@ -54,31 +59,53 @@ fn main() -> anyhow::Result<()> {
         test_data.len()
     );
 
+    let batch_size = 16;
+    let l0_size = 64; // pixels in each image
+    let l1_size = 64;
+    let l2_size = 64;
+    let l3_size = LABEL_MAX as usize + 1;
+
     // Construct computation graph.
     let mut ops = Operations::default();
-    let l0 = ops.vars::<64>();
-    let l1 = FullyConnectedLayer::new(&l0, 64, &mut ops, Expr::relu);
-    let l2 = FullyConnectedLayer::new(l1.outputs(), 64, &mut ops, Expr::relu);
-    let l3 = FullyConnectedLayer::new(l2.outputs(), 10, &mut ops, Expr::relu);
-    let y_true = ops.vars::<10>(); // One-hot encoded target
-    let loss = one_hot_mse_loss(l3.outputs(), &y_true, &mut ops).unwrap();
+
+    let l0 = nn::input_layer_vec((nn::B(batch_size), nn::O(l0_size)), &mut ops);
+    let l1 = FullyConnectedLayer::new(
+        l0.as_deref().reindex(nn::batched_output_to_input),
+        nn::O(l1_size),
+        &mut ops,
+        Expr::relu,
+    );
+    let l2 = FullyConnectedLayer::new(
+        l1.outputs().as_deref().reindex(nn::batched_output_to_input),
+        nn::O(l2_size),
+        &mut ops,
+        Expr::relu,
+    );
+    let l3 = FullyConnectedLayer::new(
+        l2.outputs().as_deref().reindex(nn::batched_output_to_input),
+        nn::O(l3_size),
+        &mut ops,
+        Expr::relu,
+    );
+    let y_true = nn::input_layer_vec((nn::B(batch_size), nn::O(l3_size)), &mut ops); // One-hot encoded target
+    let loss = loss_mse(
+        l3.outputs().as_deref().reindex(nn::batched_output_to_input),
+        y_true.as_deref().reindex(nn::batched_output_to_input),
+        &mut ops,
+    )
+    .unwrap();
     let ops = ops;
 
     // Create buffers.
     let mut values = Values::new(ops.len());
-    let mut batch_gradients = Gradients::new(ops.len());
     let mut gradients = Gradients::new(ops.len());
 
-    // Initialize parameters uniformly
-    init_weights_uniform(l1.weights(), &mut values);
-    init_weights_uniform(l1.biases(), &mut values);
-    init_weights_uniform(l2.weights(), &mut values);
-    init_weights_uniform(l2.biases(), &mut values);
-    init_weights_uniform(l3.weights(), &mut values);
-    init_weights_uniform(l3.biases(), &mut values);
+    // Initialize parameters
+    init_layer_parameters(&l1, &mut values);
+    init_layer_parameters(&l2, &mut values);
+    init_layer_parameters(&l3, &mut values);
 
     const LR: f64 = 0.005;
-    const BATCH_SIZE: usize = 16;
 
     let mut indices: Vec<usize> = (0..train_data.len()).collect();
     for epoch in 0..10 {
@@ -87,86 +114,81 @@ fn main() -> anyhow::Result<()> {
         let mut rng = rand::thread_rng();
         indices.shuffle(&mut rng);
 
-        for (batch_index, sample_indices) in indices.chunks_exact(BATCH_SIZE).enumerate() {
-            batch_gradients.fill(0.0);
-            let mut batch_loss = 0.0;
-            for &sample_index in sample_indices {
-                let &(ref pixels, label) = &train_data[sample_index];
+        for (step, sample_indices) in indices.chunks_exact(batch_size).enumerate() {
+            for (batch_index, sample_index) in sample_indices.iter().copied().enumerate_with(nn::B)
+            {
                 // Set input pixels
-                for (i, &pixel) in pixels.iter().enumerate() {
-                    values[l0[i]] = pixel as f64 / (PIXEL_MAX as f64);
+                let &(ref pixels, label) = &train_data[sample_index];
+                for (output_index, &pixel) in pixels.iter().enumerate_with(nn::O) {
+                    values[l0[(batch_index, output_index)]] = pixel as f64 / (PIXEL_MAX as f64);
                 }
 
                 // Set one-hot encoded target
-                for i in 0..=LABEL_MAX {
-                    values[y_true[i as usize]] = if i == label { 1.0 } else { 0.0 };
+                for (output_index, label_index) in (0..=LABEL_MAX).enumerate_with(nn::O) {
+                    values[y_true[(batch_index, output_index)]] =
+                        if label_index == label { 1.0 } else { 0.0 };
                 }
-
-                ops.forward(&mut values);
-                ops.backward(&values, &mut gradients, loss, LR);
-                batch_gradients.accumulate(&gradients);
-
-                batch_loss += values[loss];
             }
-            batch_loss /= BATCH_SIZE as f64;
-            println!("epoch {epoch}, batch {batch_index}, loss = {batch_loss}");
+
+            ops.forward(&mut values);
+            let batch_loss = values[loss];
+            ops.backward(&values, &mut gradients, loss, LR);
+
+            println!("epoch {epoch}, step {step}, loss = {batch_loss}");
 
             // Update parameters
-            update_weights(l1.weights(), &mut values, &batch_gradients);
-            update_weights(l1.biases(), &mut values, &batch_gradients);
-            update_weights(l2.weights(), &mut values, &batch_gradients);
-            update_weights(l2.biases(), &mut values, &batch_gradients);
-            update_weights(l3.weights(), &mut values, &batch_gradients);
-            update_weights(l3.biases(), &mut values, &batch_gradients);
+            update_weights(&l1, &mut values, &gradients);
+            update_weights(&l2, &mut values, &gradients);
+            update_weights(&l3, &mut values, &gradients);
         }
     }
 
-    // Compute predictions on test set
-    println!("\nComputing predictions on test set...");
-    let mut predictions = Vec::new();
+    // // Compute predictions on test set
+    // println!("\nComputing predictions on test set...");
+    // let mut predictions = Vec::new();
 
-    for (pixels, _) in test_data {
-        // Set input pixels
-        for (i, &pixel) in pixels.iter().enumerate() {
-            values[l0[i]] = pixel as f64 / (PIXEL_MAX as f64);
-        }
+    // for (pixels, _) in test_data {
+    //     // Set input pixels
+    //     for (i, &pixel) in pixels.iter().enumerate() {
+    //         values[l0[i]] = pixel as f64 / (PIXEL_MAX as f64);
+    //     }
 
-        ops.forward(&mut values);
+    //     ops.forward(&mut values);
 
-        // Find the class with highest output
-        let predicted_label = l3
-            .outputs()
-            .iter()
-            .enumerate()
-            .max_by_key(|&(_, &node_id)| (values[node_id] * 1000000.0) as i64)
-            .map(|(i, _)| i as u8)
-            .unwrap();
+    //     // Find the class with highest output
+    //     let predicted_label = l3
+    //         .outputs()
+    //         .iter()
+    //         .enumerate()
+    //         .max_by_key(|&(_, &node_id)| (values[node_id] * 1000000.0) as i64)
+    //         .map(|(i, _)| i as u8)
+    //         .unwrap();
 
-        predictions.push(predicted_label);
-    }
+    //     predictions.push(predicted_label);
+    // }
 
-    // Calculate accuracy
-    let correct = predictions
-        .iter()
-        .copied()
-        .zip(test_data.iter())
-        .filter(|&(pred, &(_, actual))| pred == actual)
-        .count();
-    let accuracy = correct as f64 / test_data.len() as f64;
-    println!(
-        "Test accuracy: {:.2}% ({}/{} correct)",
-        accuracy * 100.0,
-        correct,
-        test_data.len()
-    );
+    // // Calculate accuracy
+    // let correct = predictions
+    //     .iter()
+    //     .copied()
+    //     .zip(test_data.iter())
+    //     .filter(|&(pred, &(_, actual))| pred == actual)
+    //     .count();
+    // let accuracy = correct as f64 / test_data.len() as f64;
+    // println!(
+    //     "Test accuracy: {:.2}% ({}/{} correct)",
+    //     accuracy * 100.0,
+    //     correct,
+    //     test_data.len()
+    // );
 
-    // Save test images with predictions
-    save_digit_images(
-        test_data,
-        Some(&predictions),
-        "test_predictions",
-        test_data.len(),
-    )?;
+    // // Save test images with predictions
+    // save_digit_images(
+    //     test_data,
+    //     Some(&predictions),
+    //     "test_predictions",
+    //     test_data.len(),
+    // )?;
 
     Ok(())
 }
@@ -199,6 +221,7 @@ fn print_histogram<const N: usize>(histogram: &[u32; N], name: &str) {
     }
 }
 
+#[allow(unused)]
 fn save_digit_images(
     dataset: &[([u8; 64], u8)],
     predictions: Option<&[u8]>,
