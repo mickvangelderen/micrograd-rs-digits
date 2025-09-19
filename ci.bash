@@ -20,6 +20,7 @@ for command in \
     "cargo clippy --fix --allow-dirty --allow-staged" \
     "cargo +nightly fmt" \
     "cargo sort --workspace > /dev/null" \
+    "cargo test" \
 ; do
     if eval "$command"; then
         echo -e "${GREEN}✔${RESET} ${BLUE}[$dir]${RESET} $command"
