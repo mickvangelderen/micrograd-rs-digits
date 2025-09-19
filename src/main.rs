@@ -1,4 +1,5 @@
 mod dataset;
+mod serialization;
 
 use dataset::load_digits;
 use image::{ImageBuffer, Luma};
@@ -10,8 +11,173 @@ use micrograd_rs::{
 };
 use std::fs;
 
-const PIXEL_MAX: u8 = 16;
-const LABEL_MAX: u8 = 9;
+#[derive(Clone, Debug)]
+struct ModelParams {
+    batch_size: usize,
+    l0_size: usize,
+    l1_size: usize,
+    l2_size: usize,
+    l3_size: usize,
+}
+
+struct Network {
+    l0: View<Vec<NodeId>, (nn::B, nn::O)>,
+    l1: FullyConnectedLayer,
+    l2: FullyConnectedLayer,
+    l3: FullyConnectedLayer,
+}
+
+struct TrainingModel {
+    network: Network,
+    y_true: View<Vec<NodeId>, (nn::B, nn::O)>,
+    loss: NodeId,
+}
+
+struct InferenceModel {
+    network: Network,
+}
+
+impl Network {
+    fn new(params: ModelParams, ops: &mut Operations) -> Self {
+        let l0 = nn::input_layer_vec((nn::B(params.batch_size), nn::O(params.l0_size)), ops);
+        let l1 = FullyConnectedLayer::new(
+            l0.as_deref().reindex(nn::batched_output_to_input),
+            nn::O(params.l1_size),
+            ops,
+            Expr::relu,
+        );
+        let l2 = FullyConnectedLayer::new(
+            l1.outputs().as_deref().reindex(nn::batched_output_to_input),
+            nn::O(params.l2_size),
+            ops,
+            Expr::relu,
+        );
+        let l3 = FullyConnectedLayer::new(
+            l2.outputs().as_deref().reindex(nn::batched_output_to_input),
+            nn::O(params.l3_size),
+            ops,
+            Expr::relu,
+        );
+
+        Self { l0, l1, l2, l3 }
+    }
+
+    fn init_parameters(&self, values: &mut Values) {
+        init_layer_parameters(&self.l1, values);
+        init_layer_parameters(&self.l2, values);
+        init_layer_parameters(&self.l3, values);
+    }
+
+    fn update_weights(&self, values: &mut Values, gradients: &Gradients) {
+        update_weights(&self.l1, values, gradients);
+        update_weights(&self.l2, values, gradients);
+        update_weights(&self.l3, values, gradients);
+    }
+
+    fn set_input(&self, batch_index: nn::B, pixels: &[u8], values: &mut Values) {
+        for (output_index, &pixel) in pixels.iter().enumerate_with(nn::O) {
+            values[self.l0[(batch_index, output_index)]] =
+                pixel as f64 / (dataset::PIXEL_MAX as f64);
+        }
+    }
+
+    fn predictions(&self) -> View<&[NodeId], (nn::B, nn::O)> {
+        self.l3.outputs()
+    }
+
+    fn parameters(&self) -> impl Iterator<Item = NodeId> {
+        self.l1
+            .parameters()
+            .chain(self.l2.parameters())
+            .chain(self.l3.parameters())
+    }
+}
+
+impl TrainingModel {
+    fn new(params: ModelParams, ops: &mut Operations) -> Self {
+        let network = Network::new(params.clone(), ops);
+        let y_true = nn::input_layer_vec((nn::B(params.batch_size), nn::O(params.l3_size)), ops);
+        let loss = loss_mse(
+            network
+                .l3
+                .outputs()
+                .as_deref()
+                .reindex(nn::batched_output_to_input),
+            y_true.as_deref().reindex(nn::batched_output_to_input),
+            ops,
+        )
+        .unwrap();
+
+        Self {
+            network,
+            y_true,
+            loss,
+        }
+    }
+
+    fn parameters(&self) -> impl Iterator<Item = NodeId> {
+        self.network
+            .l1
+            .parameters()
+            .chain(self.network.l2.parameters())
+            .chain(self.network.l3.parameters())
+    }
+
+    fn init_parameters(&self, values: &mut Values) {
+        self.network.init_parameters(values);
+    }
+
+    fn update_weights(&self, values: &mut Values, gradients: &Gradients) {
+        self.network.update_weights(values, gradients);
+    }
+
+    fn set_input(&self, batch_index: nn::B, pixels: &[u8], values: &mut Values) {
+        self.network.set_input(batch_index, pixels, values);
+    }
+
+    fn set_target(&self, batch_index: nn::B, label: u8, values: &mut Values) {
+        for (output_index, label_index) in (0..=dataset::LABEL_MAX).enumerate_with(nn::O) {
+            values[self.y_true[(batch_index, output_index)]] =
+                if label_index == label { 1.0 } else { 0.0 };
+        }
+    }
+
+    fn loss(&self) -> NodeId {
+        self.loss
+    }
+}
+
+impl InferenceModel {
+    fn new(params: ModelParams, ops: &mut Operations) -> Self {
+        let network = Network::new(params.clone(), ops);
+        Self { network }
+    }
+
+    fn set_input(&self, batch_index: nn::B, pixels: &[u8], values: &mut Values) {
+        self.network.set_input(batch_index, pixels, values);
+    }
+
+    fn predict_single(&self, pixels: &[u8], values: &mut Values, ops: &Operations) -> u8 {
+        // Set input for single sample (batch index 0)
+        self.set_input(nn::B(0), pixels, values);
+
+        // Forward pass
+        ops.forward(values);
+
+        // Find the class with highest output
+        self.network
+            .predictions()
+            .iter()
+            .enumerate()
+            .max_by(|&(_, &a), &(_, &b)| {
+                values[a]
+                    .partial_cmp(&values[b])
+                    .expect("NaN in prediction")
+            })
+            .map(|(i, _)| i as u8)
+            .unwrap()
+    }
+}
 
 fn init_layer_parameters(layer: &FullyConnectedLayer, values: &mut Values) {
     for &weight in layer.weights().iter() {
@@ -45,11 +211,6 @@ fn main() -> anyhow::Result<()> {
     let dataset = load_digits()?;
     println!("Loaded {} samples", dataset.len());
 
-    for &(ref pixels, label) in &dataset {
-        assert!(pixels.iter().copied().all(|v| v <= PIXEL_MAX));
-        assert!(label <= LABEL_MAX);
-    }
-
     // Split dataset into train and test sets (80/20 split)
     let split_idx = (dataset.len() * 4) / 5;
     let (train_data, test_data) = dataset.split_at(split_idx);
@@ -59,41 +220,17 @@ fn main() -> anyhow::Result<()> {
         test_data.len()
     );
 
-    let batch_size = 16;
-    let l0_size = 64; // pixels in each image
-    let l1_size = 64;
-    let l2_size = 64;
-    let l3_size = LABEL_MAX as usize + 1;
+    let model_params = ModelParams {
+        batch_size: 16,
+        l0_size: 64, // pixels in each image
+        l1_size: 64,
+        l2_size: 64,
+        l3_size: dataset::LABEL_MAX as usize + 1,
+    };
 
     // Construct computation graph.
     let mut ops = Operations::default();
-
-    let l0 = nn::input_layer_vec((nn::B(batch_size), nn::O(l0_size)), &mut ops);
-    let l1 = FullyConnectedLayer::new(
-        l0.as_deref().reindex(nn::batched_output_to_input),
-        nn::O(l1_size),
-        &mut ops,
-        Expr::relu,
-    );
-    let l2 = FullyConnectedLayer::new(
-        l1.outputs().as_deref().reindex(nn::batched_output_to_input),
-        nn::O(l2_size),
-        &mut ops,
-        Expr::relu,
-    );
-    let l3 = FullyConnectedLayer::new(
-        l2.outputs().as_deref().reindex(nn::batched_output_to_input),
-        nn::O(l3_size),
-        &mut ops,
-        Expr::relu,
-    );
-    let y_true = nn::input_layer_vec((nn::B(batch_size), nn::O(l3_size)), &mut ops); // One-hot encoded target
-    let loss = loss_mse(
-        l3.outputs().as_deref().reindex(nn::batched_output_to_input),
-        y_true.as_deref().reindex(nn::batched_output_to_input),
-        &mut ops,
-    )
-    .unwrap();
+    let model = TrainingModel::new(model_params.clone(), &mut ops);
     let ops = ops;
 
     // Create buffers.
@@ -101,9 +238,7 @@ fn main() -> anyhow::Result<()> {
     let mut gradients = Gradients::new(ops.len());
 
     // Initialize parameters
-    init_layer_parameters(&l1, &mut values);
-    init_layer_parameters(&l2, &mut values);
-    init_layer_parameters(&l3, &mut values);
+    model.init_parameters(&mut values);
 
     const LR: f64 = 0.005;
 
@@ -114,111 +249,72 @@ fn main() -> anyhow::Result<()> {
         let mut rng = rand::thread_rng();
         indices.shuffle(&mut rng);
 
-        for (step, sample_indices) in indices.chunks_exact(batch_size).enumerate() {
+        for (step, sample_indices) in indices.chunks_exact(model_params.batch_size).enumerate() {
             for (batch_index, sample_index) in sample_indices.iter().copied().enumerate_with(nn::B)
             {
-                // Set input pixels
+                // Set input pixels and target
                 let &(ref pixels, label) = &train_data[sample_index];
-                for (output_index, &pixel) in pixels.iter().enumerate_with(nn::O) {
-                    values[l0[(batch_index, output_index)]] = pixel as f64 / (PIXEL_MAX as f64);
-                }
-
-                // Set one-hot encoded target
-                for (output_index, label_index) in (0..=LABEL_MAX).enumerate_with(nn::O) {
-                    values[y_true[(batch_index, output_index)]] =
-                        if label_index == label { 1.0 } else { 0.0 };
-                }
+                model.set_input(batch_index, pixels, &mut values);
+                model.set_target(batch_index, label, &mut values);
             }
 
             ops.forward(&mut values);
-            let batch_loss = values[loss];
-            ops.backward(&values, &mut gradients, loss, LR);
+            let batch_loss = values[model.loss()];
+            ops.backward(&values, &mut gradients, model.loss(), LR);
 
             println!("epoch {epoch}, step {step}, loss = {batch_loss}");
 
             // Update parameters
-            update_weights(&l1, &mut values, &gradients);
-            update_weights(&l2, &mut values, &gradients);
-            update_weights(&l3, &mut values, &gradients);
+            model.update_weights(&mut values, &gradients);
         }
     }
 
-    // // Compute predictions on test set
-    // println!("\nComputing predictions on test set...");
-    // let mut predictions = Vec::new();
+    // Compute predictions on test set
+    println!("\nComputing predictions on test set...");
+    let mut inference_ops = Operations::default();
+    let inference_model = InferenceModel::new(model_params, &mut inference_ops);
+    let inference_ops = inference_ops;
 
-    // for (pixels, _) in test_data {
-    //     // Set input pixels
-    //     for (i, &pixel) in pixels.iter().enumerate() {
-    //         values[l0[i]] = pixel as f64 / (PIXEL_MAX as f64);
-    //     }
+    let mut inference_values = Values::new(inference_ops.len());
 
-    //     ops.forward(&mut values);
+    // Copy trained weights directly
+    for (training_param, inference_param) in
+        model.parameters().zip(inference_model.network.parameters())
+    {
+        inference_values[inference_param] = values[training_param];
+    }
 
-    //     // Find the class with highest output
-    //     let predicted_label = l3
-    //         .outputs()
-    //         .iter()
-    //         .enumerate()
-    //         .max_by_key(|&(_, &node_id)| (values[node_id] * 1000000.0) as i64)
-    //         .map(|(i, _)| i as u8)
-    //         .unwrap();
+    let predictions = test_data
+        .iter()
+        .map(|&(ref pixels, _)| {
+            inference_model.predict_single(pixels, &mut inference_values, &inference_ops)
+        })
+        .collect::<Vec<_>>();
 
-    //     predictions.push(predicted_label);
-    // }
+    // Calculate accuracy
+    let correct = predictions
+        .iter()
+        .copied()
+        .zip(test_data.iter())
+        .filter(|&(pred, &(_, actual))| pred == actual)
+        .count();
+    let accuracy = correct as f64 / test_data.len() as f64;
+    println!(
+        "Test accuracy: {:.2}% ({}/{} correct)",
+        accuracy * 100.0,
+        correct,
+        test_data.len()
+    );
 
-    // // Calculate accuracy
-    // let correct = predictions
-    //     .iter()
-    //     .copied()
-    //     .zip(test_data.iter())
-    //     .filter(|&(pred, &(_, actual))| pred == actual)
-    //     .count();
-    // let accuracy = correct as f64 / test_data.len() as f64;
-    // println!(
-    //     "Test accuracy: {:.2}% ({}/{} correct)",
-    //     accuracy * 100.0,
-    //     correct,
-    //     test_data.len()
-    // );
-
-    // // Save test images with predictions
-    // save_digit_images(
-    //     test_data,
-    //     Some(&predictions),
-    //     "test_predictions",
-    //     test_data.len(),
-    // )?;
+    // Save test images with predictions
+    save_digit_images(
+        test_data,
+        Some(&predictions),
+        "test_predictions",
+        test_data.len(),
+    )?;
 
     Ok(())
-}
-
-#[allow(unused)]
-fn compute_and_print_histograms(dataset: &Vec<([u8; 64], u8)>) {
-    // Compute pixel histogram
-    let mut pixel_histogram = [0u32; 256];
-    for (pixels, _) in dataset {
-        for &pixel in pixels {
-            pixel_histogram[pixel as usize] += 1;
-        }
-    }
-    print_histogram(&pixel_histogram, "Pixel value");
-
-    // Compute label histogram
-    let mut label_histogram = [0u32; 10];
-    for (_, label) in dataset {
-        label_histogram[*label as usize] += 1;
-    }
-    print_histogram(&label_histogram, "Label");
-}
-
-fn print_histogram<const N: usize>(histogram: &[u32; N], name: &str) {
-    println!("\n{} histogram:", name);
-    for (value, &count) in histogram.iter().enumerate() {
-        if count > 0 {
-            println!("  {}: {}", value, count);
-        }
-    }
 }
 
 #[allow(unused)]
