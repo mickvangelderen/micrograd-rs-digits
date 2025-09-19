@@ -10,7 +10,7 @@ use micrograd_rs::{
     iter_ext::IteratorExt as _,
     nn,
 };
-use models::mlp::{InferenceModel, ModelParams, TrainingModel};
+use models::mlp::{FullyConnectedLayerParams, InferenceModel, ModelParams, TrainingModel};
 use rand::prelude::*;
 
 #[derive(Debug, Copy, Clone)]
@@ -18,8 +18,9 @@ struct TrainingParams {
     epochs: usize,
     learning_rate: f64,
 }
-use serialization::{Load, Save};
 use std::fs;
+
+use serialization::{Load, Save};
 
 #[derive(Parser)]
 #[command(name = "micrograd-rs-digits")]
@@ -64,10 +65,7 @@ fn main() -> anyhow::Result<()> {
             learning_rate,
             seed,
         } => {
-            let training_params = TrainingParams {
-                epochs,
-                learning_rate,
-            };
+            let training_params = TrainingParams { epochs, learning_rate };
             train(weights_path, train_data, training_params, seed)
         }
         Commands::Test { weights_path } => test(weights_path, test_data),
@@ -88,15 +86,19 @@ fn train(
 
     let model_params = ModelParams {
         batch_size: 16,
-        l0_size: 64, // pixels in each image
-        l1_size: 64,
-        l2_size: 64,
-        l3_size: dataset::LABEL_MAX as usize + 1,
+        input_size: 64, // pixels in each image
+        layers: vec![
+            FullyConnectedLayerParams { size: 64 },
+            FullyConnectedLayerParams { size: 64 },
+            FullyConnectedLayerParams {
+                size: dataset::LABEL_MAX as usize + 1,
+            },
+        ],
     };
 
     // Construct computation graph.
     let mut ops = Operations::default();
-    let model = TrainingModel::new(model_params, &mut ops);
+    let model = TrainingModel::new(&model_params, &mut ops);
     let ops = ops;
 
     // Create buffers.
@@ -121,32 +123,24 @@ fn train(
             let inputs = model.inputs();
             let targets = model.targets();
 
-            for (batch_index, sample_index) in sample_indices.iter().copied().enumerate_with(nn::B)
-            {
+            for (batch_index, sample_index) in sample_indices.iter().copied().enumerate_with(nn::B) {
                 // Set input pixels and target
                 let &(ref pixels, label) = &train_data[sample_index];
 
                 // Set normalized pixels directly using view indexing
                 for (input_index, &pixel) in pixels.iter().enumerate_with(nn::I) {
-                    values[inputs[(batch_index, input_index)]] =
-                        pixel as f64 / dataset::PIXEL_MAX as f64;
+                    values[inputs[(batch_index, input_index)]] = pixel as f64 / dataset::PIXEL_MAX as f64;
                 }
 
                 // Set one-hot encoded target directly using view indexing
                 for (output_index, target_index) in (0..=dataset::LABEL_MAX).enumerate_with(nn::O) {
-                    values[targets[(batch_index, output_index)]] =
-                        if target_index == label { 1.0 } else { 0.0 };
+                    values[targets[(batch_index, output_index)]] = if target_index == label { 1.0 } else { 0.0 };
                 }
             }
 
             ops.forward(&mut values);
             let batch_loss = values[model.loss()];
-            ops.backward(
-                &values,
-                &mut gradients,
-                model.loss(),
-                training_params.learning_rate,
-            );
+            ops.backward(&values, &mut gradients, model.loss(), training_params.learning_rate);
 
             println!(
                 "epoch {:3}/{:3}, step {:4}/{:4}, loss = {batch_loss}",
@@ -182,15 +176,19 @@ fn test(weights_path: String, test_data: &[([u8; 64], u8)]) -> anyhow::Result<()
     // May only differ from training in fields that do not affect model parameters, such as the batch size.
     let model_params = ModelParams {
         batch_size: 1,
-        l0_size: 64, // pixels in each image
-        l1_size: 64,
-        l2_size: 64,
-        l3_size: dataset::LABEL_MAX as usize + 1,
+        input_size: 64, // pixels in each image
+        layers: vec![
+            FullyConnectedLayerParams { size: 64 },
+            FullyConnectedLayerParams { size: 64 },
+            FullyConnectedLayerParams {
+                size: dataset::LABEL_MAX as usize + 1,
+            },
+        ],
     };
 
     // Construct computation graph for inference
     let mut inference_ops = Operations::default();
-    let inference_model = InferenceModel::new(model_params, &mut inference_ops);
+    let inference_model = InferenceModel::new(&model_params, &mut inference_ops);
     let inference_ops = inference_ops;
 
     let mut inference_values = Values::new(inference_ops.len());
@@ -199,9 +197,7 @@ fn test(weights_path: String, test_data: &[([u8; 64], u8)]) -> anyhow::Result<()
     println!("Loading weights from {}", weights_path);
     {
         let mut reader = std::io::BufReader::new(std::fs::File::open(&weights_path)?);
-        inference_model
-            .network
-            .load(&mut inference_values, &mut reader)?;
+        inference_model.network.load(&mut inference_values, &mut reader)?;
     }
 
     let predictions = test_data
@@ -212,11 +208,7 @@ fn test(weights_path: String, test_data: &[([u8; 64], u8)]) -> anyhow::Result<()
                 .iter()
                 .map(|&pixel| pixel as f64 / dataset::PIXEL_MAX as f64)
                 .collect();
-            inference_model.predict_single(
-                &normalized_pixels,
-                &mut inference_values,
-                &inference_ops,
-            )
+            inference_model.predict_single(&normalized_pixels, &mut inference_values, &inference_ops)
         })
         .collect::<Vec<_>>();
 
@@ -235,12 +227,7 @@ fn test(weights_path: String, test_data: &[([u8; 64], u8)]) -> anyhow::Result<()
         test_data.len()
     );
 
-    save_digit_images(
-        test_data,
-        Some(&predictions),
-        "out/predictions",
-        test_data.len(),
-    )?;
+    save_digit_images(test_data, Some(&predictions), "out/predictions", test_data.len())?;
 
     Ok(())
 }
@@ -257,8 +244,7 @@ fn save_digit_images(
         // Create 8x8 grayscale image from 64 pixels
         let img = ImageBuffer::from_fn(8, 8, |x, y| {
             let pixel_index = (y * 8 + x) as usize;
-            let pixel_value =
-                (pixels[pixel_index] as f32 / dataset::PIXEL_MAX as f32 * 255.0) as u8;
+            let pixel_value = (pixels[pixel_index] as f32 / dataset::PIXEL_MAX as f32 * 255.0) as u8;
             Luma([pixel_value])
         });
 

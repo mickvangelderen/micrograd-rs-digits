@@ -1,10 +1,11 @@
+use std::io::{Read, Write};
+
 use anyhow::Result;
 use byteorder::{LE, ReadBytesExt, WriteBytesExt};
 use micrograd_rs::{
     engine::Values,
     nn::{self, FullyConnectedLayer},
 };
-use std::io::{Read, Write};
 
 pub trait Save {
     fn save(&self, values: &Values, writer: &mut impl Write) -> Result<()>;
@@ -52,9 +53,11 @@ impl Load for FullyConnectedLayer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use micrograd_rs::{engine::Operations, nn};
     use std::io::Cursor;
+
+    use micrograd_rs::{engine::Operations, nn};
+
+    use super::*;
 
     #[test]
     fn save_and_load_fully_connected_layer() {

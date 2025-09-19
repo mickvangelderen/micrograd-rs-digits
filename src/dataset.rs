@@ -2,7 +2,8 @@ use std::{fs, io};
 
 use anyhow::Result;
 
-const DIGITS_URL: &str = "https://raw.githubusercontent.com/scikit-learn/scikit-learn/main/sklearn/datasets/data/digits.csv.gz";
+const DIGITS_URL: &str =
+    "https://raw.githubusercontent.com/scikit-learn/scikit-learn/main/sklearn/datasets/data/digits.csv.gz";
 pub const PIXEL_MAX: u8 = 16;
 pub const LABEL_MAX: u8 = 9;
 
@@ -33,10 +34,7 @@ fn load_digits_file() -> Result<fs::File> {
         }
     }
 
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&cache_path)?;
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&cache_path)?;
 
     // FIXME: Should use tempfile and atomic rename and file lock instead, now readers can open a partially written file.
     let response = ureq::get(DIGITS_URL).call()?;
