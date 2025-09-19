@@ -1,4 +1,3 @@
-use crate::{InferenceModel, Network, TrainingModel};
 use anyhow::Result;
 use byteorder::{LE, ReadBytesExt, WriteBytesExt};
 use micrograd_rs::{
@@ -17,7 +16,6 @@ pub trait Load {
 
 impl Save for FullyConnectedLayer {
     fn save(&self, values: &Values, writer: &mut impl Write) -> Result<()> {
-        writer.write_u64::<LE>(usize::from(self.batch_count) as u64)?;
         writer.write_u64::<LE>(usize::from(self.input_count) as u64)?;
         writer.write_u64::<LE>(usize::from(self.output_count) as u64)?;
 
@@ -33,12 +31,11 @@ impl Save for FullyConnectedLayer {
 
 impl Load for FullyConnectedLayer {
     fn load(&self, values: &mut Values, reader: &mut impl Read) -> Result<()> {
-        let batch_count = nn::B(reader.read_u64::<LE>()? as usize);
         let input_count = nn::I(reader.read_u64::<LE>()? as usize);
         let output_count = nn::O(reader.read_u64::<LE>()? as usize);
 
-        let expected = (self.batch_count, self.input_count, self.output_count);
-        let actual = (batch_count, input_count, output_count);
+        let expected = (self.input_count, self.output_count);
+        let actual = (input_count, output_count);
         if expected != actual {
             anyhow::bail!("Layer shape mismatch: expected {expected:?} but got {actual:?}",);
         }
@@ -53,88 +50,48 @@ impl Load for FullyConnectedLayer {
     }
 }
 
-impl Save for Network {
-    fn save(&self, values: &Values, writer: &mut impl Write) -> Result<()> {
-        self.l1.save(values, writer)?;
-        self.l2.save(values, writer)?;
-        self.l3.save(values, writer)?;
-        Ok(())
-    }
-}
-
-impl Load for Network {
-    fn load(&self, values: &mut Values, reader: &mut impl Read) -> Result<()> {
-        self.l1.load(values, reader)?;
-        self.l2.load(values, reader)?;
-        self.l3.load(values, reader)?;
-        Ok(())
-    }
-}
-
-impl Save for TrainingModel {
-    fn save(&self, values: &Values, writer: &mut impl Write) -> Result<()> {
-        self.network.save(values, writer)
-    }
-}
-
-impl Load for TrainingModel {
-    fn load(&self, values: &mut Values, reader: &mut impl Read) -> Result<()> {
-        self.network.load(values, reader)
-    }
-}
-
-impl Save for InferenceModel {
-    fn save(&self, values: &Values, writer: &mut impl Write) -> Result<()> {
-        self.network.save(values, writer)
-    }
-}
-
-impl Load for InferenceModel {
-    fn load(&self, values: &mut Values, reader: &mut impl Read) -> Result<()> {
-        self.network.load(values, reader)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ModelParams, TrainingModel};
-    use micrograd_rs::engine::Operations;
+    use micrograd_rs::{engine::Operations, nn};
     use std::io::Cursor;
 
     #[test]
-    fn save_and_load() {
-        // Create a test model using the actual model structs
-        let params = ModelParams {
-            batch_size: 2,
-            l0_size: 3,
-            l1_size: 4,
-            l2_size: 2,
-            l3_size: 1,
-        };
-
+    fn save_and_load_fully_connected_layer() {
         let mut ops = Operations::default();
-        let model = TrainingModel::new(params, &mut ops);
-        let ops = ops;
+        let input = nn::input_layer_vec((nn::B(2), nn::O(3)), &mut ops);
+        let layer = FullyConnectedLayer::new(
+            input.as_deref().reindex(nn::batched_output_to_input),
+            nn::O(4),
+            &mut ops,
+            micrograd_rs::engine::Expr::relu,
+        );
 
-        let mut values = Values::new(ops.len());
-        for (index, node) in model.parameters().enumerate() {
-            values[node] = index as f64;
+        let mut values = micrograd_rs::engine::Values::new(ops.len());
+
+        // Set predictable values for weights and biases
+        for (index, &node) in layer.weights().iter().enumerate() {
+            values[node] = (index as f64) * 0.1;
+        }
+        for (index, &node) in layer.biases().iter().enumerate() {
+            values[node] = (index as f64) * 0.01;
         }
 
         let mut serialized = Vec::new();
-
-        Save::save(&model, &values, &mut serialized).unwrap();
+        Save::save(&layer, &values, &mut serialized).unwrap();
 
         // Reset values to NaN and load
         values.fill(f64::NAN);
 
         let mut cursor = Cursor::new(serialized);
-        Load::load(&model, &mut values, &mut cursor).unwrap();
+        Load::load(&layer, &mut values, &mut cursor).unwrap();
 
-        // Verify all weights and biases match the original predictable values
-        for (index, node) in model.parameters().enumerate() {
-            assert_eq!(values[node], index as f64);
+        // Verify weights and biases match original values
+        for (index, &node) in layer.weights().iter().enumerate() {
+            assert_eq!(values[node], (index as f64) * 0.1);
+        }
+        for (index, &node) in layer.biases().iter().enumerate() {
+            assert_eq!(values[node], (index as f64) * 0.01);
         }
     }
 }
