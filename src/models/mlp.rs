@@ -59,10 +59,10 @@ impl Network {
         Self { l0, l1, l2, l3 }
     }
 
-    pub fn init_parameters(&self, values: &mut Values) {
-        init_layer_parameters(&self.l1, values);
-        init_layer_parameters(&self.l2, values);
-        init_layer_parameters(&self.l3, values);
+    pub fn init_parameters(&self, values: &mut Values, rng: &mut impl rand::Rng) {
+        init_layer_parameters(&self.l1, values, rng);
+        init_layer_parameters(&self.l2, values, rng);
+        init_layer_parameters(&self.l3, values, rng);
     }
 
     pub fn update_weights(&self, values: &mut Values, gradients: &Gradients) {
@@ -109,8 +109,8 @@ impl TrainingModel {
         }
     }
 
-    pub fn init_parameters(&self, values: &mut Values) {
-        self.network.init_parameters(values);
+    pub fn init_parameters(&self, values: &mut Values, rng: &mut impl rand::Rng) {
+        self.network.init_parameters(values, rng);
     }
 
     pub fn update_weights(&self, values: &mut Values, gradients: &Gradients) {
@@ -179,9 +179,17 @@ impl InferenceModel {
     }
 }
 
-fn init_layer_parameters(layer: &FullyConnectedLayer, values: &mut Values) {
-    for &weight in layer.weights().iter() {
-        values[weight] = (rand::random::<f64>() - 0.5) * 0.1;
+fn init_layer_parameters(
+    layer: &FullyConnectedLayer,
+    values: &mut Values,
+    rng: &mut impl rand::Rng,
+) {
+    use rand::distr::Distribution;
+
+    let dist = rand::distr::Uniform::new(-0.05, 0.05).unwrap();
+
+    for (&weight, value) in layer.weights().iter().zip(dist.sample_iter(rng)) {
+        values[weight] = value;
     }
     for &bias in layer.biases().iter() {
         values[bias] = 0.0;

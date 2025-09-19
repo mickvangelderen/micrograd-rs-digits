@@ -11,6 +11,7 @@ use micrograd_rs::{
     nn,
 };
 use models::mlp::{InferenceModel, ModelParams, TrainingModel};
+use rand::prelude::*;
 
 #[derive(Debug, Copy, Clone)]
 struct TrainingParams {
@@ -37,6 +38,8 @@ enum Commands {
         epochs: usize,
         #[arg(long, default_value = "0.01")]
         learning_rate: f64,
+        #[arg(long)]
+        seed: Option<u64>,
     },
     Test {
         #[arg(default_value = "out/weights.bin")]
@@ -59,12 +62,13 @@ fn main() -> anyhow::Result<()> {
             weights_path,
             epochs,
             learning_rate,
+            seed,
         } => {
             let training_params = TrainingParams {
                 epochs,
                 learning_rate,
             };
-            train(weights_path, train_data, training_params)
+            train(weights_path, train_data, training_params, seed)
         }
         Commands::Test { weights_path } => test(weights_path, test_data),
     }
@@ -74,6 +78,7 @@ fn train(
     weights_path: String,
     train_data: &[([u8; 64], u8)],
     training_params: TrainingParams,
+    seed: Option<u64>,
 ) -> anyhow::Result<()> {
     println!("Train samples: {}", train_data.len());
     println!(
@@ -98,14 +103,17 @@ fn train(
     let mut values = Values::new(ops.len());
     let mut gradients = Gradients::new(ops.len());
 
+    let mut rng = if let Some(seed_val) = seed {
+        StdRng::seed_from_u64(seed_val)
+    } else {
+        StdRng::from_os_rng()
+    };
+
     // Initialize parameters
-    model.init_parameters(&mut values);
+    model.init_parameters(&mut values, &mut rng);
 
     let mut indices: Vec<usize> = (0..train_data.len()).collect();
     for epoch in 0..training_params.epochs {
-        // Create and shuffle index vector for this epoch
-        use rand::seq::SliceRandom;
-        let mut rng = rand::thread_rng();
         indices.shuffle(&mut rng);
 
         let total_steps = indices.chunks_exact(model_params.batch_size).len();
