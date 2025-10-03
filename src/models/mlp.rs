@@ -2,116 +2,22 @@
 
 use std::io::{Read, Write};
 
-use anyhow::Result;
 use byteorder::{LE, ReadBytesExt, WriteBytesExt};
 use micrograd_rs::{
     engine::{Expr, Gradients, NodeId, Operations, Values},
     iter_ext::IteratorExt as _,
-    nn::{self, FullyConnectedLayer},
-    view::{IndexTuple, View},
+    nn::{
+        self, Deserialize, FullyConnectedLayer, FullyConnectedLayerParams, MultiLayerPerceptron,
+        MultiLayerPerceptronParams, Result, Serialize,
+    },
+    view::{Index, IndexTuple, View},
 };
-
-use crate::serialization::{Load, Save};
-
-#[derive(Debug, Clone)]
-pub struct FullyConnectedLayerParams {
-    pub size: usize,
-}
 
 #[derive(Debug, Clone)]
 pub struct ModelParams {
-    pub batch_size: usize,
-    pub input_size: usize,
-    pub layers: Vec<FullyConnectedLayerParams>,
-}
-
-pub struct MultiLayerPerceptron {
-    pub layers: Vec<FullyConnectedLayer>,
-}
-
-impl MultiLayerPerceptron {
-    pub fn new(
-        input_layer: View<&[NodeId], (nn::B, nn::O)>,
-        layer_params: &[FullyConnectedLayerParams],
-        ops: &mut Operations,
-    ) -> Self {
-        let layers = layer_params
-            .iter()
-            .fold(Vec::with_capacity(layer_params.len()), |mut layers, params| {
-                let prev_output = layers
-                    .last()
-                    .map_or(input_layer, |layer: &FullyConnectedLayer| layer.outputs());
-                let layer = FullyConnectedLayer::new(
-                    prev_output.as_deref().reindex(nn::batched_output_to_input),
-                    nn::O(params.size),
-                    ops,
-                    Expr::relu,
-                );
-                layers.push(layer);
-                layers
-            });
-
-        Self { layers }
-    }
-
-    pub fn init_parameters(&self, values: &mut Values, rng: &mut impl rand::Rng) {
-        for layer in &self.layers {
-            init_layer_parameters(layer, values, rng);
-        }
-    }
-
-    pub fn update_weights(&self, values: &mut Values, gradients: &Gradients) {
-        for layer in &self.layers {
-            update_weights(layer, values, gradients);
-        }
-    }
-
-    pub fn outputs(&self) -> View<&[NodeId], (nn::B, nn::O)> {
-        self.layers
-            .last()
-            .expect("Network must have at least one layer")
-            .outputs()
-    }
-
-    pub fn parameters(&self) -> impl Iterator<Item = NodeId> {
-        self.layers.iter().flat_map(|layer| {
-            layer
-                .weights()
-                .into_iter()
-                .copied()
-                .chain(layer.biases().into_iter().copied())
-        })
-    }
-}
-
-impl Save for MultiLayerPerceptron {
-    fn save(&self, values: &Values, writer: &mut impl Write) -> Result<()> {
-        writer.write_u64::<LE>(self.layers.len() as u64)?;
-
-        for layer in &self.layers {
-            layer.save(values, writer)?;
-        }
-        Ok(())
-    }
-}
-
-impl Load for MultiLayerPerceptron {
-    fn load(&self, values: &mut Values, reader: &mut impl Read) -> Result<()> {
-        let layer_count = reader.read_u64::<LE>()? as usize;
-
-        if layer_count != self.layers.len() {
-            anyhow::bail!(
-                "Layer count mismatch: expected {} but got {}",
-                self.layers.len(),
-                layer_count
-            );
-        }
-
-        for layer in &self.layers {
-            layer.load(values, reader)?;
-        }
-        Ok(())
-    }
+    pub batch_size: nn::B,
+    pub input_size: nn::O,
+    pub mlp: Vec<FullyConnectedLayerParams>,
 }
 
 pub struct TrainingModel {
@@ -123,11 +29,11 @@ pub struct TrainingModel {
 
 impl TrainingModel {
     pub fn new(params: &ModelParams, ops: &mut Operations) -> Self {
-        let input_layer = nn::input_layer_vec((nn::B(params.batch_size), nn::O(params.input_size)), ops);
-        let network = MultiLayerPerceptron::new(input_layer.as_deref(), &params.layers, ops);
+        let input_layer = nn::input_layer_vec((params.batch_size, params.input_size), ops);
 
-        let output_size = params.layers.last().expect("Model must have at least one layer").size;
-        let y_true = nn::input_layer_vec((nn::B(params.batch_size), nn::O(output_size)), ops);
+        let network = MultiLayerPerceptron::new(input_layer.as_deref(), params.mlp.as_slice(), ops);
+
+        let y_true = nn::input_layer_vec(network.outputs().shape(), ops);
 
         let loss = loss_mse(
             network.outputs().as_deref().reindex(nn::batched_output_to_input),
@@ -169,15 +75,15 @@ impl TrainingModel {
     }
 }
 
-impl Save for TrainingModel {
-    fn save(&self, values: &Values, writer: &mut impl Write) -> Result<()> {
-        self.network.save(values, writer)
+impl Serialize for TrainingModel {
+    fn serialize(&self, values: &Values, writer: &mut impl Write) -> Result<()> {
+        self.network.serialize(values, writer)
     }
 }
 
-impl Load for TrainingModel {
-    fn load(&self, values: &mut Values, reader: &mut impl Read) -> Result<()> {
-        self.network.load(values, reader)
+impl Deserialize for TrainingModel {
+    fn deserialize(&self, values: &mut Values, reader: &mut impl Read) -> Result<()> {
+        self.network.deserialize(values, reader)
     }
 }
 
@@ -188,9 +94,8 @@ pub struct InferenceModel {
 
 impl InferenceModel {
     pub fn new(params: &ModelParams, ops: &mut Operations) -> Self {
-        assert_eq!(params.batch_size, 1);
-        let input_layer = nn::input_layer_vec((nn::B(params.batch_size), nn::O(params.input_size)), ops);
-        let network = MultiLayerPerceptron::new(input_layer.as_deref(), &params.layers, ops);
+        let input_layer = nn::input_layer_vec((params.batch_size, params.input_size), ops);
+        let network = MultiLayerPerceptron::new(input_layer.as_deref(), params.mlp.as_slice(), ops);
         Self { input_layer, network }
     }
 
@@ -221,34 +126,15 @@ impl InferenceModel {
     }
 }
 
-impl Save for InferenceModel {
-    fn save(&self, values: &Values, writer: &mut impl Write) -> Result<()> {
-        self.network.save(values, writer)
+impl Serialize for InferenceModel {
+    fn serialize(&self, values: &Values, writer: &mut impl Write) -> Result<()> {
+        self.network.serialize(values, writer)
     }
 }
 
-impl Load for InferenceModel {
-    fn load(&self, values: &mut Values, reader: &mut impl Read) -> Result<()> {
-        self.network.load(values, reader)
-    }
-}
-
-fn init_layer_parameters(layer: &FullyConnectedLayer, values: &mut Values, rng: &mut impl rand::Rng) {
-    use rand::distr::Distribution;
-
-    let dist = rand::distr::Uniform::new(-0.05, 0.05).unwrap();
-
-    for (&weight, value) in layer.weights().iter().zip(dist.sample_iter(rng)) {
-        values[weight] = value;
-    }
-    for &bias in layer.biases().iter() {
-        values[bias] = 0.0;
-    }
-}
-
-fn update_weights(layer: &FullyConnectedLayer, values: &mut Values, gradients: &Gradients) {
-    for &node in layer.weights().iter().chain(layer.biases().iter()) {
-        values[node] -= gradients[node];
+impl Deserialize for InferenceModel {
+    fn deserialize(&self, values: &mut Values, reader: &mut impl Read) -> Result<()> {
+        self.network.deserialize(values, reader)
     }
 }
 
@@ -257,9 +143,9 @@ fn loss_mse(
     y: View<&[NodeId], (nn::B, nn::I)>,
     ops: &mut Operations,
 ) -> Option<NodeId> {
-    assert_eq!(y_pred.len(), y.len());
+    assert_eq!(y_pred.shape(), y.shape());
     // We can sum over the batch and over the output dimensions.
-    let mut terms = y_pred.len().indices().map(|i| (y_pred[i] - y[i]).pow_2());
+    let mut terms = y_pred.shape().indices().map(|i| (y_pred[i] - y[i]).pow_2());
     let first = terms.next().map(|term| ops.insert(term))?;
     Some(terms.fold(first, |sum, term| ops.insert(sum + term)))
 }
@@ -275,12 +161,12 @@ mod tests {
     #[test]
     fn save_and_load_training_model() {
         let params = ModelParams {
-            batch_size: 2,
-            input_size: 3,
-            layers: vec![
-                FullyConnectedLayerParams { size: 4 },
-                FullyConnectedLayerParams { size: 2 },
-                FullyConnectedLayerParams { size: 1 },
+            batch_size: nn::B(2),
+            input_size: nn::O(3),
+            mlp: vec![
+                FullyConnectedLayerParams { output_size: nn::O(4) },
+                FullyConnectedLayerParams { output_size: nn::O(2) },
+                FullyConnectedLayerParams { output_size: nn::O(1) },
             ],
         };
 
@@ -294,7 +180,7 @@ mod tests {
                 values[node] = index as f64;
             }
             let mut serialized = Vec::new();
-            Save::save(&model, &values, &mut serialized).unwrap();
+            Serialize::serialize(&model, &values, &mut serialized).unwrap();
             Cursor::new(serialized)
         };
 
@@ -302,15 +188,15 @@ mod tests {
         let mut ops = Operations::default();
         let model = InferenceModel::new(
             &ModelParams {
-                batch_size: 1,
+                batch_size: nn::B(1),
                 input_size: params.input_size,
-                layers: params.layers.clone(),
+                mlp: params.mlp.clone(),
             },
             &mut ops,
         );
         let ops = ops;
         let mut values = Values::new(ops.len());
-        Load::load(&model, &mut values, &mut reader).unwrap();
+        Deserialize::deserialize(&model, &mut values, &mut reader).unwrap();
 
         for (index, node) in model.parameters().enumerate() {
             assert_eq!(values[node], index as f64);

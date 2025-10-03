@@ -1,6 +1,5 @@
 mod dataset;
 mod models;
-mod serialization;
 
 use clap::{Parser, Subcommand};
 use dataset::load_digits;
@@ -8,9 +7,9 @@ use image::{ImageBuffer, Luma};
 use micrograd_rs::{
     engine::{Gradients, Operations, Values},
     iter_ext::IteratorExt as _,
-    nn,
+    nn::{self, FullyConnectedLayerParams},
 };
-use models::mlp::{FullyConnectedLayerParams, InferenceModel, ModelParams, TrainingModel};
+use models::mlp::{InferenceModel, ModelParams, TrainingModel};
 use rand::prelude::*;
 
 #[derive(Debug, Copy, Clone)]
@@ -20,7 +19,7 @@ struct TrainingParams {
 }
 use std::fs;
 
-use serialization::{Load, Save};
+use micrograd_rs::nn::{Deserialize, Serialize};
 
 #[derive(Parser)]
 #[command(name = "micrograd-rs-digits")]
@@ -85,13 +84,13 @@ fn train(
     );
 
     let model_params = ModelParams {
-        batch_size: 16,
-        input_size: 64, // pixels in each image
-        layers: vec![
-            FullyConnectedLayerParams { size: 64 },
-            FullyConnectedLayerParams { size: 64 },
+        batch_size: nn::B(16),
+        input_size: nn::O(64), // pixels in each image
+        mlp: vec![
+            FullyConnectedLayerParams { output_size: nn::O(64) },
+            FullyConnectedLayerParams { output_size: nn::O(64) },
             FullyConnectedLayerParams {
-                size: dataset::LABEL_MAX as usize + 1,
+                output_size: nn::O(dataset::LABEL_MAX as usize + 1),
             },
         ],
     };
@@ -118,8 +117,8 @@ fn train(
     for epoch in 0..training_params.epochs {
         indices.shuffle(&mut rng);
 
-        let total_steps = indices.chunks_exact(model_params.batch_size).len();
-        for (step, sample_indices) in indices.chunks_exact(model_params.batch_size).enumerate() {
+        let total_steps = indices.chunks_exact(model_params.batch_size.0).len();
+        for (step, sample_indices) in indices.chunks_exact(model_params.batch_size.0).enumerate() {
             let inputs = model.inputs();
             let targets = model.targets();
 
@@ -163,7 +162,7 @@ fn train(
         }
         let file = std::fs::File::create(&weights_path)?;
         let mut writer = std::io::BufWriter::new(file);
-        model.save(&values, &mut writer)?;
+        model.serialize(&values, &mut writer)?;
     }
     println!("Training completed!");
 
@@ -175,13 +174,13 @@ fn test(weights_path: String, test_data: &[([u8; 64], u8)]) -> anyhow::Result<()
 
     // May only differ from training in fields that do not affect model parameters, such as the batch size.
     let model_params = ModelParams {
-        batch_size: 1,
-        input_size: 64, // pixels in each image
-        layers: vec![
-            FullyConnectedLayerParams { size: 64 },
-            FullyConnectedLayerParams { size: 64 },
+        batch_size: nn::B(1),
+        input_size: nn::O(64), // pixels in each image
+        mlp: vec![
+            FullyConnectedLayerParams { output_size: nn::O(64) },
+            FullyConnectedLayerParams { output_size: nn::O(64) },
             FullyConnectedLayerParams {
-                size: dataset::LABEL_MAX as usize + 1,
+                output_size: nn::O(dataset::LABEL_MAX as usize + 1),
             },
         ],
     };
@@ -197,7 +196,9 @@ fn test(weights_path: String, test_data: &[([u8; 64], u8)]) -> anyhow::Result<()
     println!("Loading weights from {}", weights_path);
     {
         let mut reader = std::io::BufReader::new(std::fs::File::open(&weights_path)?);
-        inference_model.network.load(&mut inference_values, &mut reader)?;
+        inference_model
+            .network
+            .deserialize(&mut inference_values, &mut reader)?;
     }
 
     let predictions = test_data
